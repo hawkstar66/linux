@@ -1636,7 +1636,6 @@ static int pxp_soft_reset(struct pxp_dev *dev)
 static int pxp_probe(struct platform_device *pdev)
 {
 	struct pxp_dev *dev;
-	struct resource *res;
 	struct video_device *vfd;
 	int irq;
 	int ret;
@@ -1652,19 +1651,13 @@ static int pxp_probe(struct platform_device *pdev)
 		return ret;
 	}
 
-	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
-	dev->mmio = devm_ioremap_resource(&pdev->dev, res);
-	if (IS_ERR(dev->mmio)) {
-		ret = PTR_ERR(dev->mmio);
-		dev_err(&pdev->dev, "Failed to map register space: %d\n", ret);
-		return ret;
-	}
+	dev->mmio = devm_platform_ioremap_resource(pdev, 0);
+	if (IS_ERR(dev->mmio))
+		return PTR_ERR(dev->mmio);
 
 	irq = platform_get_irq(pdev, 0);
-	if (irq < 0) {
-		dev_err(&pdev->dev, "Failed to get irq resource: %d\n", irq);
+	if (irq < 0)
 		return irq;
-	}
 
 	ret = devm_request_threaded_irq(&pdev->dev, irq, NULL, pxp_irq_handler,
 			IRQF_ONESHOT, dev_name(&pdev->dev), dev);
@@ -1711,7 +1704,7 @@ static int pxp_probe(struct platform_device *pdev)
 		goto err_v4l2;
 	}
 
-	ret = video_register_device(vfd, VFL_TYPE_GRABBER, 0);
+	ret = video_register_device(vfd, VFL_TYPE_VIDEO, 0);
 	if (ret) {
 		v4l2_err(&dev->v4l2_dev, "Failed to register video device\n");
 		goto err_m2m;
@@ -1757,7 +1750,7 @@ static struct platform_driver pxp_driver = {
 	.remove		= pxp_remove,
 	.driver		= {
 		.name	= MEM2MEM_NAME,
-		.of_match_table = of_match_ptr(pxp_dt_ids),
+		.of_match_table = pxp_dt_ids,
 	},
 };
 

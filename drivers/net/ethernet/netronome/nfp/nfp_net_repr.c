@@ -103,6 +103,7 @@ nfp_repr_get_stats64(struct net_device *netdev, struct rtnl_link_stats64 *stats)
 	case NFP_PORT_PF_PORT:
 	case NFP_PORT_VF_PORT:
 		nfp_repr_vnic_get_stats64(repr->port, stats);
+		break;
 	default:
 		break;
 	}
@@ -300,7 +301,6 @@ static void nfp_repr_clean(struct nfp_repr *repr)
 }
 
 static struct lock_class_key nfp_repr_netdev_xmit_lock_key;
-static struct lock_class_key nfp_repr_netdev_addr_lock_key;
 
 static void nfp_repr_set_lockdep_class_one(struct net_device *dev,
 					   struct netdev_queue *txq,
@@ -311,7 +311,6 @@ static void nfp_repr_set_lockdep_class_one(struct net_device *dev,
 
 static void nfp_repr_set_lockdep_class(struct net_device *dev)
 {
-	lockdep_set_class(&dev->addr_list_lock, &nfp_repr_netdev_addr_lock_key);
 	netdev_for_each_tx_queue(dev, nfp_repr_set_lockdep_class_one, NULL);
 }
 
@@ -500,8 +499,7 @@ struct nfp_reprs *nfp_reprs_alloc(unsigned int num_reprs)
 {
 	struct nfp_reprs *reprs;
 
-	reprs = kzalloc(sizeof(*reprs) +
-			num_reprs * sizeof(struct net_device *), GFP_KERNEL);
+	reprs = kzalloc(struct_size(reprs, reprs, num_reprs), GFP_KERNEL);
 	if (!reprs)
 		return NULL;
 	reprs->num_reprs = num_reprs;

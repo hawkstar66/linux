@@ -9,10 +9,12 @@ Linux PCI Bus Subsystem
    :numbered:
 
    pci
-   picebus-howto
+   pciebus-howto
    pci-iov-howto
    msi-howto
+   sysfs-pci
    acpi-info
    pci-error-recovery
    pcieaer-howto
    endpoint/index
+   boot-interrupts

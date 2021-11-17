@@ -92,6 +92,7 @@
 #define JZ_SOC_DATA_PROGRAMMABLE_DMA	BIT(1)
 #define JZ_SOC_DATA_PER_CHAN_PM		BIT(2)
 #define JZ_SOC_DATA_NO_DCKES_DCKEC	BIT(3)
+#define JZ_SOC_DATA_BREAK_LINKS		BIT(4)
 
 /**
  * struct jz4780_dma_hwdesc - descriptor structure read by the DMA controller.
@@ -355,6 +356,7 @@ static struct dma_async_tx_descriptor *jz4780_dma_prep_slave_sg(
 	void *context)
 {
 	struct jz4780_dma_chan *jzchan = to_jz4780_dma_chan(chan);
+	struct jz4780_dma_dev *jzdma = jz4780_dma_chan_parent(jzchan);
 	struct jz4780_dma_desc *desc;
 	unsigned int i;
 	int err;
@@ -375,7 +377,8 @@ static struct dma_async_tx_descriptor *jz4780_dma_prep_slave_sg(
 
 		desc->desc[i].dcm |= JZ_DMA_DCM_TIE;
 
-		if (i != (sg_len - 1)) {
+		if (i != (sg_len - 1) &&
+		    !(jzdma->soc_data->flags & JZ_SOC_DATA_BREAK_LINKS)) {
 			/* Automatically proceeed to the next descriptor. */
 			desc->desc[i].dcm |= JZ_DMA_DCM_LINK;
 
@@ -636,11 +639,11 @@ static enum dma_status jz4780_dma_tx_status(struct dma_chan *chan,
 	unsigned long flags;
 	unsigned long residue = 0;
 
+	spin_lock_irqsave(&jzchan->vchan.lock, flags);
+
 	status = dma_cookie_status(chan, cookie, txstate);
 	if ((status == DMA_COMPLETE) || (txstate == NULL))
-		return status;
-
-	spin_lock_irqsave(&jzchan->vchan.lock, flags);
+		goto out_unlock_irqrestore;
 
 	vdesc = vchan_find_desc(&jzchan->vchan, cookie);
 	if (vdesc) {
@@ -657,6 +660,7 @@ static enum dma_status jz4780_dma_tx_status(struct dma_chan *chan,
 	    && jzchan->desc->status & (JZ_DMA_DCS_AR | JZ_DMA_DCS_HLT))
 		status = DMA_ERROR;
 
+out_unlock_irqrestore:
 	spin_unlock_irqrestore(&jzchan->vchan.lock, flags);
 	return status;
 }
@@ -664,6 +668,8 @@ static enum dma_status jz4780_dma_tx_status(struct dma_chan *chan,
 static bool jz4780_dma_chan_irq(struct jz4780_dma_dev *jzdma,
 				struct jz4780_dma_chan *jzchan)
 {
+	const unsigned int soc_flags = jzdma->soc_data->flags;
+	struct jz4780_dma_desc *desc = jzchan->desc;
 	uint32_t dcs;
 	bool ack = true;
 
@@ -691,8 +697,11 @@ static bool jz4780_dma_chan_irq(struct jz4780_dma_dev *jzdma,
 
 				jz4780_dma_begin(jzchan);
 			} else if (dcs & JZ_DMA_DCS_TT) {
-				vchan_cookie_complete(&jzchan->desc->vdesc);
-				jzchan->desc = NULL;
+				if (!(soc_flags & JZ_SOC_DATA_BREAK_LINKS) ||
+				    (jzchan->curr_hwdesc + 1 == desc->count)) {
+					vchan_cookie_complete(&desc->vdesc);
+					jzchan->desc = NULL;
+				}
 
 				jz4780_dma_begin(jzchan);
 			} else {
@@ -850,13 +859,7 @@ static int jz4780_dma_probe(struct platform_device *pdev)
 	jzdma->soc_data = soc_data;
 	platform_set_drvdata(pdev, jzdma);
 
-	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
-	if (!res) {
-		dev_err(dev, "failed to get I/O memory\n");
-		return -EINVAL;
-	}
-
-	jzdma->chn_base = devm_ioremap_resource(dev, res);
+	jzdma->chn_base = devm_platform_ioremap_resource(pdev, 0);
 	if (IS_ERR(jzdma->chn_base))
 		return PTR_ERR(jzdma->chn_base);
 
@@ -877,26 +880,11 @@ static int jz4780_dma_probe(struct platform_device *pdev)
 		return -EINVAL;
 	}
 
-	ret = platform_get_irq(pdev, 0);
-	if (ret < 0) {
-		dev_err(dev, "failed to get IRQ: %d\n", ret);
-		return ret;
-	}
-
-	jzdma->irq = ret;
-
-	ret = request_irq(jzdma->irq, jz4780_dma_irq_handler, 0, dev_name(dev),
-			  jzdma);
-	if (ret) {
-		dev_err(dev, "failed to request IRQ %u!\n", jzdma->irq);
-		return ret;
-	}
-
 	jzdma->clk = devm_clk_get(dev, NULL);
 	if (IS_ERR(jzdma->clk)) {
 		dev_err(dev, "failed to get clock\n");
 		ret = PTR_ERR(jzdma->clk);
-		goto err_free_irq;
+		return ret;
 	}
 
 	clk_prepare_enable(jzdma->clk);
@@ -927,6 +915,7 @@ static int jz4780_dma_probe(struct platform_device *pdev)
 	dd->dst_addr_widths = JZ_DMA_BUSWIDTHS;
 	dd->directions = BIT(DMA_DEV_TO_MEM) | BIT(DMA_MEM_TO_DEV);
 	dd->residue_granularity = DMA_RESIDUE_GRANULARITY_BURST;
+	dd->max_sg_burst = JZ_DMA_MAX_DESC;
 
 	/*
 	 * Enable DMA controller, mark all channels as not programmable.
@@ -949,10 +938,23 @@ static int jz4780_dma_probe(struct platform_device *pdev)
 		jzchan->vchan.desc_free = jz4780_dma_desc_free;
 	}
 
+	ret = platform_get_irq(pdev, 0);
+	if (ret < 0)
+		goto err_disable_clk;
+
+	jzdma->irq = ret;
+
+	ret = request_irq(jzdma->irq, jz4780_dma_irq_handler, 0, dev_name(dev),
+			  jzdma);
+	if (ret) {
+		dev_err(dev, "failed to request IRQ %u!\n", jzdma->irq);
+		goto err_disable_clk;
+	}
+
 	ret = dmaenginem_async_device_register(dd);
 	if (ret) {
 		dev_err(dev, "failed to register device\n");
-		goto err_disable_clk;
+		goto err_free_irq;
 	}
 
 	/* Register with OF DMA helpers. */
@@ -960,17 +962,17 @@ static int jz4780_dma_probe(struct platform_device *pdev)
 					 jzdma);
 	if (ret) {
 		dev_err(dev, "failed to register OF DMA controller\n");
-		goto err_disable_clk;
+		goto err_free_irq;
 	}
 
 	dev_info(dev, "JZ4780 DMA controller initialised\n");
 	return 0;
 
-err_disable_clk:
-	clk_disable_unprepare(jzdma->clk);
-
 err_free_irq:
 	free_irq(jzdma->irq, jzdma);
+
+err_disable_clk:
+	clk_disable_unprepare(jzdma->clk);
 	return ret;
 }
 
@@ -981,6 +983,7 @@ static int jz4780_dma_remove(struct platform_device *pdev)
 
 	of_dma_controller_free(pdev->dev.of_node);
 
+	clk_disable_unprepare(jzdma->clk);
 	free_irq(jzdma->irq, jzdma);
 
 	for (i = 0; i < jzdma->soc_data->nb_channels; i++)
@@ -992,12 +995,26 @@ static int jz4780_dma_remove(struct platform_device *pdev)
 static const struct jz4780_dma_soc_data jz4740_dma_soc_data = {
 	.nb_channels = 6,
 	.transfer_ord_max = 5,
+	.flags = JZ_SOC_DATA_BREAK_LINKS,
 };
 
 static const struct jz4780_dma_soc_data jz4725b_dma_soc_data = {
 	.nb_channels = 6,
 	.transfer_ord_max = 5,
+	.flags = JZ_SOC_DATA_PER_CHAN_PM | JZ_SOC_DATA_NO_DCKES_DCKEC |
+		 JZ_SOC_DATA_BREAK_LINKS,
+};
+
+static const struct jz4780_dma_soc_data jz4760_dma_soc_data = {
+	.nb_channels = 5,
+	.transfer_ord_max = 6,
 	.flags = JZ_SOC_DATA_PER_CHAN_PM | JZ_SOC_DATA_NO_DCKES_DCKEC,
+};
+
+static const struct jz4780_dma_soc_data jz4760b_dma_soc_data = {
+	.nb_channels = 5,
+	.transfer_ord_max = 6,
+	.flags = JZ_SOC_DATA_PER_CHAN_PM,
 };
 
 static const struct jz4780_dma_soc_data jz4770_dma_soc_data = {
@@ -1012,11 +1029,27 @@ static const struct jz4780_dma_soc_data jz4780_dma_soc_data = {
 	.flags = JZ_SOC_DATA_ALLOW_LEGACY_DT | JZ_SOC_DATA_PROGRAMMABLE_DMA,
 };
 
+static const struct jz4780_dma_soc_data x1000_dma_soc_data = {
+	.nb_channels = 8,
+	.transfer_ord_max = 7,
+	.flags = JZ_SOC_DATA_PROGRAMMABLE_DMA,
+};
+
+static const struct jz4780_dma_soc_data x1830_dma_soc_data = {
+	.nb_channels = 32,
+	.transfer_ord_max = 7,
+	.flags = JZ_SOC_DATA_PROGRAMMABLE_DMA,
+};
+
 static const struct of_device_id jz4780_dma_dt_match[] = {
 	{ .compatible = "ingenic,jz4740-dma", .data = &jz4740_dma_soc_data },
 	{ .compatible = "ingenic,jz4725b-dma", .data = &jz4725b_dma_soc_data },
+	{ .compatible = "ingenic,jz4760-dma", .data = &jz4760_dma_soc_data },
+	{ .compatible = "ingenic,jz4760b-dma", .data = &jz4760b_dma_soc_data },
 	{ .compatible = "ingenic,jz4770-dma", .data = &jz4770_dma_soc_data },
 	{ .compatible = "ingenic,jz4780-dma", .data = &jz4780_dma_soc_data },
+	{ .compatible = "ingenic,x1000-dma", .data = &x1000_dma_soc_data },
+	{ .compatible = "ingenic,x1830-dma", .data = &x1830_dma_soc_data },
 	{},
 };
 MODULE_DEVICE_TABLE(of, jz4780_dma_dt_match);
@@ -1026,7 +1059,7 @@ static struct platform_driver jz4780_dma_driver = {
 	.remove		= jz4780_dma_remove,
 	.driver	= {
 		.name	= "jz4780-dma",
-		.of_match_table = of_match_ptr(jz4780_dma_dt_match),
+		.of_match_table = jz4780_dma_dt_match,
 	},
 };
 

@@ -9,7 +9,7 @@
 struct siw_umem *siw_umem_get(u64 start, u64 len, bool writable);
 void siw_umem_release(struct siw_umem *umem, bool dirty);
 struct siw_pbl *siw_pbl_alloc(u32 num_buf);
-u64 siw_pbl_get_buffer(struct siw_pbl *pbl, u64 off, int *len, int *idx);
+dma_addr_t siw_pbl_get_buffer(struct siw_pbl *pbl, u64 off, int *len, int *idx);
 struct siw_mem *siw_mem_id2obj(struct siw_device *sdev, int stag_index);
 int siw_mem_add(struct siw_device *sdev, struct siw_mem *m);
 int siw_invalidate_stag(struct ib_pd *pd, u32 stag);
@@ -27,11 +27,6 @@ void siw_free_mem(struct kref *ref);
 static inline void siw_mem_put(struct siw_mem *mem)
 {
 	kref_put(&mem->ref, siw_free_mem);
-}
-
-static inline struct siw_mr *siw_mem2mr(struct siw_mem *m)
-{
-	return container_of(m, struct siw_mr, mem);
 }
 
 static inline void siw_unref_mem_sgl(struct siw_mem **mem, unsigned int num_sge)

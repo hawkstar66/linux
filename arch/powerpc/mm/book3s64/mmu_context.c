@@ -17,9 +17,12 @@
 #include <linux/export.h>
 #include <linux/gfp.h>
 #include <linux/slab.h>
+#include <linux/cpu.h>
 
 #include <asm/mmu_context.h>
 #include <asm/pgalloc.h>
+
+#include "internal.h"
 
 static DEFINE_IDA(mmu_context_ida);
 
@@ -47,8 +50,6 @@ int hash__alloc_context_id(void)
 	return alloc_context_id(MIN_USER_CONTEXT, max);
 }
 EXPORT_SYMBOL_GPL(hash__alloc_context_id);
-
-void slb_setup_new_exec(void);
 
 static int realloc_context_ids(mm_context_t *ctx)
 {
@@ -118,7 +119,7 @@ static int hash__init_new_context(struct mm_struct *mm)
 		/* This is fork. Copy hash_context details from current->mm */
 		memcpy(mm->context.hash_context, current->mm->context.hash_context, sizeof(struct hash_mm_context));
 #ifdef CONFIG_PPC_SUBPAGE_PROT
-		/* inherit subpage prot detalis if we have one. */
+		/* inherit subpage prot details if we have one. */
 		if (current->mm->context.hash_context->spt) {
 			mm->context.hash_context->spt = kmalloc(sizeof(struct subpage_prot_table),
 								GFP_KERNEL);
@@ -256,8 +257,21 @@ void destroy_context(struct mm_struct *mm)
 #ifdef CONFIG_SPAPR_TCE_IOMMU
 	WARN_ON_ONCE(!list_empty(&mm->context.iommu_group_mem_list));
 #endif
+	/*
+	 * For tasks which were successfully initialized we end up calling
+	 * arch_exit_mmap() which clears the process table entry. And
+	 * arch_exit_mmap() is called before the required fullmm TLB flush
+	 * which does a RIC=2 flush. Hence for an initialized task, we do clear
+	 * any cached process table entries.
+	 *
+	 * The condition below handles the error case during task init. We have
+	 * set the process table entry early and if we fail a task
+	 * initialization, we need to ensure the process table entry is zeroed.
+	 * We need not worry about process table entry caches because the task
+	 * never ran with the PID value.
+	 */
 	if (radix_enabled())
-		WARN_ON(process_tb[mm->context.id].prtb0 != 0);
+		process_tb[mm->context.id].prtb0 = 0;
 	else
 		subpage_prot_free(mm);
 	destroy_contexts(&mm->context);
@@ -292,5 +306,24 @@ void radix__switch_mmu_context(struct mm_struct *prev, struct mm_struct *next)
 {
 	mtspr(SPRN_PID, next->context.id);
 	isync();
+}
+#endif
+
+/**
+ * cleanup_cpu_mmu_context - Clean up MMU details for this CPU (newly offlined)
+ *
+ * This clears the CPU from mm_cpumask for all processes, and then flushes the
+ * local TLB to ensure TLB coherency in case the CPU is onlined again.
+ *
+ * KVM guest translations are not necessarily flushed here. If KVM started
+ * using mm_cpumask or the Linux APIs which do, this would have to be resolved.
+ */
+#ifdef CONFIG_HOTPLUG_CPU
+void cleanup_cpu_mmu_context(void)
+{
+	int cpu = smp_processor_id();
+
+	clear_tasks_mm_cpumask(cpu);
+	tlbiel_all();
 }
 #endif

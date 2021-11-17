@@ -25,9 +25,58 @@
 #define TLS_PAYLOAD_MAX_LEN 16384
 #define SOL_TLS 282
 
-#ifndef ENOTSUPP
-#define ENOTSUPP 524
-#endif
+struct tls_crypto_info_keys {
+	union {
+		struct tls12_crypto_info_aes_gcm_128 aes128;
+		struct tls12_crypto_info_chacha20_poly1305 chacha20;
+		struct tls12_crypto_info_sm4_gcm sm4gcm;
+		struct tls12_crypto_info_sm4_ccm sm4ccm;
+	};
+	size_t len;
+};
+
+static void tls_crypto_info_init(uint16_t tls_version, uint16_t cipher_type,
+				 struct tls_crypto_info_keys *tls12)
+{
+	memset(tls12, 0, sizeof(*tls12));
+
+	switch (cipher_type) {
+	case TLS_CIPHER_CHACHA20_POLY1305:
+		tls12->len = sizeof(struct tls12_crypto_info_chacha20_poly1305);
+		tls12->chacha20.info.version = tls_version;
+		tls12->chacha20.info.cipher_type = cipher_type;
+		break;
+	case TLS_CIPHER_AES_GCM_128:
+		tls12->len = sizeof(struct tls12_crypto_info_aes_gcm_128);
+		tls12->aes128.info.version = tls_version;
+		tls12->aes128.info.cipher_type = cipher_type;
+		break;
+	case TLS_CIPHER_SM4_GCM:
+		tls12->len = sizeof(struct tls12_crypto_info_sm4_gcm);
+		tls12->sm4gcm.info.version = tls_version;
+		tls12->sm4gcm.info.cipher_type = cipher_type;
+		break;
+	case TLS_CIPHER_SM4_CCM:
+		tls12->len = sizeof(struct tls12_crypto_info_sm4_ccm);
+		tls12->sm4ccm.info.version = tls_version;
+		tls12->sm4ccm.info.cipher_type = cipher_type;
+		break;
+	default:
+		break;
+	}
+}
+
+static void memrnd(void *s, size_t n)
+{
+	int *dword = s;
+	char *byte;
+
+	for (; n >= 4; n -= 4)
+		*dword++ = rand();
+	byte = (void *)dword;
+	while (n--)
+		*byte++ = rand();
+}
 
 FIXTURE(tls_basic)
 {
@@ -105,9 +154,51 @@ FIXTURE(tls)
 	bool notls;
 };
 
+FIXTURE_VARIANT(tls)
+{
+	uint16_t tls_version;
+	uint16_t cipher_type;
+};
+
+FIXTURE_VARIANT_ADD(tls, 12_aes_gcm)
+{
+	.tls_version = TLS_1_2_VERSION,
+	.cipher_type = TLS_CIPHER_AES_GCM_128,
+};
+
+FIXTURE_VARIANT_ADD(tls, 13_aes_gcm)
+{
+	.tls_version = TLS_1_3_VERSION,
+	.cipher_type = TLS_CIPHER_AES_GCM_128,
+};
+
+FIXTURE_VARIANT_ADD(tls, 12_chacha)
+{
+	.tls_version = TLS_1_2_VERSION,
+	.cipher_type = TLS_CIPHER_CHACHA20_POLY1305,
+};
+
+FIXTURE_VARIANT_ADD(tls, 13_chacha)
+{
+	.tls_version = TLS_1_3_VERSION,
+	.cipher_type = TLS_CIPHER_CHACHA20_POLY1305,
+};
+
+FIXTURE_VARIANT_ADD(tls, 13_sm4_gcm)
+{
+	.tls_version = TLS_1_3_VERSION,
+	.cipher_type = TLS_CIPHER_SM4_GCM,
+};
+
+FIXTURE_VARIANT_ADD(tls, 13_sm4_ccm)
+{
+	.tls_version = TLS_1_3_VERSION,
+	.cipher_type = TLS_CIPHER_SM4_CCM,
+};
+
 FIXTURE_SETUP(tls)
 {
-	struct tls12_crypto_info_aes_gcm_128 tls12;
+	struct tls_crypto_info_keys tls12;
 	struct sockaddr_in addr;
 	socklen_t len;
 	int sfd, ret;
@@ -115,9 +206,8 @@ FIXTURE_SETUP(tls)
 	self->notls = false;
 	len = sizeof(addr);
 
-	memset(&tls12, 0, sizeof(tls12));
-	tls12.info.version = TLS_1_3_VERSION;
-	tls12.info.cipher_type = TLS_CIPHER_AES_GCM_128;
+	tls_crypto_info_init(variant->tls_version, variant->cipher_type,
+			     &tls12);
 
 	addr.sin_family = AF_INET;
 	addr.sin_addr.s_addr = htonl(INADDR_ANY);
@@ -145,7 +235,7 @@ FIXTURE_SETUP(tls)
 
 	if (!self->notls) {
 		ret = setsockopt(self->fd, SOL_TLS, TLS_TX, &tls12,
-				 sizeof(tls12));
+				 tls12.len);
 		ASSERT_EQ(ret, 0);
 	}
 
@@ -158,7 +248,7 @@ FIXTURE_SETUP(tls)
 		ASSERT_EQ(ret, 0);
 
 		ret = setsockopt(self->cfd, SOL_TLS, TLS_RX, &tls12,
-				 sizeof(tls12));
+				 tls12.len);
 		ASSERT_EQ(ret, 0);
 	}
 
@@ -202,11 +292,71 @@ TEST_F(tls, send_then_sendfile)
 	EXPECT_EQ(recv(self->cfd, buf, st.st_size, MSG_WAITALL), st.st_size);
 }
 
+static void chunked_sendfile(struct __test_metadata *_metadata,
+			     struct _test_data_tls *self,
+			     uint16_t chunk_size,
+			     uint16_t extra_payload_size)
+{
+	char buf[TLS_PAYLOAD_MAX_LEN];
+	uint16_t test_payload_size;
+	int size = 0;
+	int ret;
+	char filename[] = "/tmp/mytemp.XXXXXX";
+	int fd = mkstemp(filename);
+	off_t offset = 0;
+
+	unlink(filename);
+	ASSERT_GE(fd, 0);
+	EXPECT_GE(chunk_size, 1);
+	test_payload_size = chunk_size + extra_payload_size;
+	ASSERT_GE(TLS_PAYLOAD_MAX_LEN, test_payload_size);
+	memset(buf, 1, test_payload_size);
+	size = write(fd, buf, test_payload_size);
+	EXPECT_EQ(size, test_payload_size);
+	fsync(fd);
+
+	while (size > 0) {
+		ret = sendfile(self->fd, fd, &offset, chunk_size);
+		EXPECT_GE(ret, 0);
+		size -= ret;
+	}
+
+	EXPECT_EQ(recv(self->cfd, buf, test_payload_size, MSG_WAITALL),
+		  test_payload_size);
+
+	close(fd);
+}
+
+TEST_F(tls, multi_chunk_sendfile)
+{
+	chunked_sendfile(_metadata, self, 4096, 4096);
+	chunked_sendfile(_metadata, self, 4096, 0);
+	chunked_sendfile(_metadata, self, 4096, 1);
+	chunked_sendfile(_metadata, self, 4096, 2048);
+	chunked_sendfile(_metadata, self, 8192, 2048);
+	chunked_sendfile(_metadata, self, 4096, 8192);
+	chunked_sendfile(_metadata, self, 8192, 4096);
+	chunked_sendfile(_metadata, self, 12288, 1024);
+	chunked_sendfile(_metadata, self, 12288, 2000);
+	chunked_sendfile(_metadata, self, 15360, 100);
+	chunked_sendfile(_metadata, self, 15360, 300);
+	chunked_sendfile(_metadata, self, 1, 4096);
+	chunked_sendfile(_metadata, self, 2048, 4096);
+	chunked_sendfile(_metadata, self, 2048, 8192);
+	chunked_sendfile(_metadata, self, 4096, 8192);
+	chunked_sendfile(_metadata, self, 1024, 12288);
+	chunked_sendfile(_metadata, self, 2000, 12288);
+	chunked_sendfile(_metadata, self, 100, 15360);
+	chunked_sendfile(_metadata, self, 300, 15360);
+}
+
 TEST_F(tls, recv_max)
 {
 	unsigned int send_len = TLS_PAYLOAD_MAX_LEN;
 	char recv_mem[TLS_PAYLOAD_MAX_LEN];
 	char buf[TLS_PAYLOAD_MAX_LEN];
+
+	memrnd(buf, sizeof(buf));
 
 	EXPECT_GE(send(self->fd, buf, send_len, 0), 0);
 	EXPECT_NE(recv(self->cfd, recv_mem, send_len, 0), -1);
@@ -268,6 +418,38 @@ TEST_F(tls, sendmsg_single)
 	EXPECT_EQ(memcmp(buf, test_str, send_len), 0);
 }
 
+#define MAX_FRAGS	64
+#define SEND_LEN	13
+TEST_F(tls, sendmsg_fragmented)
+{
+	char const *test_str = "test_sendmsg";
+	char buf[SEND_LEN * MAX_FRAGS];
+	struct iovec vec[MAX_FRAGS];
+	struct msghdr msg;
+	int i, frags;
+
+	for (frags = 1; frags <= MAX_FRAGS; frags++) {
+		for (i = 0; i < frags; i++) {
+			vec[i].iov_base = (char *)test_str;
+			vec[i].iov_len = SEND_LEN;
+		}
+
+		memset(&msg, 0, sizeof(struct msghdr));
+		msg.msg_iov = vec;
+		msg.msg_iovlen = frags;
+
+		EXPECT_EQ(sendmsg(self->fd, &msg, 0), SEND_LEN * frags);
+		EXPECT_EQ(recv(self->cfd, buf, SEND_LEN * frags, MSG_WAITALL),
+			  SEND_LEN * frags);
+
+		for (i = 0; i < frags; i++)
+			EXPECT_EQ(memcmp(buf + SEND_LEN * i,
+					 test_str, SEND_LEN), 0);
+	}
+}
+#undef MAX_FRAGS
+#undef SEND_LEN
+
 TEST_F(tls, sendmsg_large)
 {
 	void *mem = malloc(16384);
@@ -286,8 +468,9 @@ TEST_F(tls, sendmsg_large)
 		EXPECT_EQ(sendmsg(self->cfd, &msg, 0), send_len);
 	}
 
-	while (recvs++ < sends)
+	while (recvs++ < sends) {
 		EXPECT_NE(recv(self->fd, mem, send_len, 0), -1);
+	}
 
 	free(mem);
 }
@@ -456,6 +639,8 @@ TEST_F(tls, recvmsg_single_max)
 	struct iovec vec;
 	struct msghdr hdr;
 
+	memrnd(send_mem, sizeof(send_mem));
+
 	EXPECT_EQ(send(self->fd, send_mem, send_len, 0), send_len);
 	vec.iov_base = (char *)recv_mem;
 	vec.iov_len = TLS_PAYLOAD_MAX_LEN;
@@ -469,7 +654,6 @@ TEST_F(tls, recvmsg_single_max)
 TEST_F(tls, recvmsg_multiple)
 {
 	unsigned int msg_iovlen = 1024;
-	unsigned int len_compared = 0;
 	struct iovec vec[1024];
 	char *iov_base[1024];
 	unsigned int iov_len = 16;
@@ -477,6 +661,8 @@ TEST_F(tls, recvmsg_multiple)
 	char buf[1 << 14];
 	struct msghdr hdr;
 	int i;
+
+	memrnd(buf, sizeof(buf));
 
 	EXPECT_EQ(send(self->fd, buf, send_len, 0), send_len);
 	for (i = 0; i < msg_iovlen; i++) {
@@ -488,8 +674,6 @@ TEST_F(tls, recvmsg_multiple)
 	hdr.msg_iovlen = msg_iovlen;
 	hdr.msg_iov = vec;
 	EXPECT_NE(recvmsg(self->cfd, &hdr, 0), -1);
-	for (i = 0; i < msg_iovlen; i++)
-		len_compared += iov_len;
 
 	for (i = 0; i < msg_iovlen; i++)
 		free(iov_base[i]);
@@ -501,6 +685,8 @@ TEST_F(tls, single_send_multiple_recv)
 	unsigned int send_len = TLS_PAYLOAD_MAX_LEN;
 	char send_mem[TLS_PAYLOAD_MAX_LEN * 2];
 	char recv_mem[TLS_PAYLOAD_MAX_LEN * 2];
+
+	memrnd(send_mem, sizeof(send_mem));
 
 	EXPECT_GE(send(self->fd, send_mem, total_len, 0), 0);
 	memset(recv_mem, 0, total_len);
@@ -702,18 +888,17 @@ TEST_F(tls, bidir)
 	int ret;
 
 	if (!self->notls) {
-		struct tls12_crypto_info_aes_gcm_128 tls12;
+		struct tls_crypto_info_keys tls12;
 
-		memset(&tls12, 0, sizeof(tls12));
-		tls12.info.version = TLS_1_3_VERSION;
-		tls12.info.cipher_type = TLS_CIPHER_AES_GCM_128;
+		tls_crypto_info_init(variant->tls_version, variant->cipher_type,
+				     &tls12);
 
 		ret = setsockopt(self->fd, SOL_TLS, TLS_RX, &tls12,
-				 sizeof(tls12));
+				 tls12.len);
 		ASSERT_EQ(ret, 0);
 
 		ret = setsockopt(self->cfd, SOL_TLS, TLS_TX, &tls12,
-				 sizeof(tls12));
+				 tls12.len);
 		ASSERT_EQ(ret, 0);
 	}
 
@@ -898,6 +1083,114 @@ TEST_F(tls, nonblocking)
 	}
 }
 
+static void
+test_mutliproc(struct __test_metadata *_metadata, struct _test_data_tls *self,
+	       bool sendpg, unsigned int n_readers, unsigned int n_writers)
+{
+	const unsigned int n_children = n_readers + n_writers;
+	const size_t data = 6 * 1000 * 1000;
+	const size_t file_sz = data / 100;
+	size_t read_bias, write_bias;
+	int i, fd, child_id;
+	char buf[file_sz];
+	pid_t pid;
+
+	/* Only allow multiples for simplicity */
+	ASSERT_EQ(!(n_readers % n_writers) || !(n_writers % n_readers), true);
+	read_bias = n_writers / n_readers ?: 1;
+	write_bias = n_readers / n_writers ?: 1;
+
+	/* prep a file to send */
+	fd = open("/tmp/", O_TMPFILE | O_RDWR, 0600);
+	ASSERT_GE(fd, 0);
+
+	memset(buf, 0xac, file_sz);
+	ASSERT_EQ(write(fd, buf, file_sz), file_sz);
+
+	/* spawn children */
+	for (child_id = 0; child_id < n_children; child_id++) {
+		pid = fork();
+		ASSERT_NE(pid, -1);
+		if (!pid)
+			break;
+	}
+
+	/* parent waits for all children */
+	if (pid) {
+		for (i = 0; i < n_children; i++) {
+			int status;
+
+			wait(&status);
+			EXPECT_EQ(status, 0);
+		}
+
+		return;
+	}
+
+	/* Split threads for reading and writing */
+	if (child_id < n_readers) {
+		size_t left = data * read_bias;
+		char rb[8001];
+
+		while (left) {
+			int res;
+
+			res = recv(self->cfd, rb,
+				   left > sizeof(rb) ? sizeof(rb) : left, 0);
+
+			EXPECT_GE(res, 0);
+			left -= res;
+		}
+	} else {
+		size_t left = data * write_bias;
+
+		while (left) {
+			int res;
+
+			ASSERT_EQ(lseek(fd, 0, SEEK_SET), 0);
+			if (sendpg)
+				res = sendfile(self->fd, fd, NULL,
+					       left > file_sz ? file_sz : left);
+			else
+				res = send(self->fd, buf,
+					   left > file_sz ? file_sz : left, 0);
+
+			EXPECT_GE(res, 0);
+			left -= res;
+		}
+	}
+}
+
+TEST_F(tls, mutliproc_even)
+{
+	test_mutliproc(_metadata, self, false, 6, 6);
+}
+
+TEST_F(tls, mutliproc_readers)
+{
+	test_mutliproc(_metadata, self, false, 4, 12);
+}
+
+TEST_F(tls, mutliproc_writers)
+{
+	test_mutliproc(_metadata, self, false, 10, 2);
+}
+
+TEST_F(tls, mutliproc_sendpage_even)
+{
+	test_mutliproc(_metadata, self, true, 6, 6);
+}
+
+TEST_F(tls, mutliproc_sendpage_readers)
+{
+	test_mutliproc(_metadata, self, true, 4, 12);
+}
+
+TEST_F(tls, mutliproc_sendpage_writers)
+{
+	test_mutliproc(_metadata, self, true, 10, 2);
+}
+
 TEST_F(tls, control_msg)
 {
 	if (self->notls)
@@ -1037,11 +1330,11 @@ TEST(non_established) {
 	/* TLS ULP not supported */
 	if (errno == ENOENT)
 		return;
-	EXPECT_EQ(errno, ENOTSUPP);
+	EXPECT_EQ(errno, ENOTCONN);
 
 	ret = setsockopt(sfd, IPPROTO_TCP, TCP_ULP, "tls", sizeof("tls"));
 	EXPECT_EQ(ret, -1);
-	EXPECT_EQ(errno, ENOTSUPP);
+	EXPECT_EQ(errno, ENOTCONN);
 
 	ret = getsockname(sfd, &addr, &len);
 	ASSERT_EQ(ret, 0);
@@ -1118,80 +1411,6 @@ TEST(keysizes) {
 	}
 
 	close(sfd);
-	close(fd);
-	close(cfd);
-}
-
-TEST(tls12) {
-	int fd, cfd;
-	bool notls;
-
-	struct tls12_crypto_info_aes_gcm_128 tls12;
-	struct sockaddr_in addr;
-	socklen_t len;
-	int sfd, ret;
-
-	notls = false;
-	len = sizeof(addr);
-
-	memset(&tls12, 0, sizeof(tls12));
-	tls12.info.version = TLS_1_2_VERSION;
-	tls12.info.cipher_type = TLS_CIPHER_AES_GCM_128;
-
-	addr.sin_family = AF_INET;
-	addr.sin_addr.s_addr = htonl(INADDR_ANY);
-	addr.sin_port = 0;
-
-	fd = socket(AF_INET, SOCK_STREAM, 0);
-	sfd = socket(AF_INET, SOCK_STREAM, 0);
-
-	ret = bind(sfd, &addr, sizeof(addr));
-	ASSERT_EQ(ret, 0);
-	ret = listen(sfd, 10);
-	ASSERT_EQ(ret, 0);
-
-	ret = getsockname(sfd, &addr, &len);
-	ASSERT_EQ(ret, 0);
-
-	ret = connect(fd, &addr, sizeof(addr));
-	ASSERT_EQ(ret, 0);
-
-	ret = setsockopt(fd, IPPROTO_TCP, TCP_ULP, "tls", sizeof("tls"));
-	if (ret != 0) {
-		notls = true;
-		printf("Failure setting TCP_ULP, testing without tls\n");
-	}
-
-	if (!notls) {
-		ret = setsockopt(fd, SOL_TLS, TLS_TX, &tls12,
-				 sizeof(tls12));
-		ASSERT_EQ(ret, 0);
-	}
-
-	cfd = accept(sfd, &addr, &len);
-	ASSERT_GE(cfd, 0);
-
-	if (!notls) {
-		ret = setsockopt(cfd, IPPROTO_TCP, TCP_ULP, "tls",
-				 sizeof("tls"));
-		ASSERT_EQ(ret, 0);
-
-		ret = setsockopt(cfd, SOL_TLS, TLS_RX, &tls12,
-				 sizeof(tls12));
-		ASSERT_EQ(ret, 0);
-	}
-
-	close(sfd);
-
-	char const *test_str = "test_read";
-	int send_len = 10;
-	char buf[10];
-
-	send_len = strlen(test_str) + 1;
-	EXPECT_EQ(send(fd, test_str, send_len, 0), send_len);
-	EXPECT_NE(recv(cfd, buf, send_len, 0), -1);
-	EXPECT_EQ(memcmp(buf, test_str, send_len), 0);
-
 	close(fd);
 	close(cfd);
 }

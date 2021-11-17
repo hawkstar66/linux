@@ -29,6 +29,8 @@
 .endm
 
 #define ASM_NL		 `	/* use '`' to mark new line in macro */
+#define __ALIGN		.align 4
+#define __ALIGN_STR	__stringify(__ALIGN)
 
 /* annotation for data we want in DCCM - if enabled in .config */
 .macro ARCFP_DATA nm
@@ -62,15 +64,15 @@
 #else	/* !__ASSEMBLY__ */
 
 #ifdef CONFIG_ARC_HAS_ICCM
-#define __arcfp_code __attribute__((__section__(".text.arcfp")))
+#define __arcfp_code __section(".text.arcfp")
 #else
-#define __arcfp_code __attribute__((__section__(".text")))
+#define __arcfp_code __section(".text")
 #endif
 
 #ifdef CONFIG_ARC_HAS_DCCM
-#define __arcfp_data __attribute__((__section__(".data.arcfp")))
+#define __arcfp_data __section(".data.arcfp")
 #else
-#define __arcfp_data __attribute__((__section__(".data")))
+#define __arcfp_data __section(".data")
 #endif
 
 #endif /* __ASSEMBLY__ */

@@ -519,7 +519,7 @@ error:
  * @head: list to search
  * @size: size of node to find, must be a power of two.
  *
- * Description: This function sorts the resource list by size and then returns
+ * Description: This function sorts the resource list by size and then
  * returns the first node of "size" length that is not in the ISA aliasing
  * window.  If it finds a node larger than "size" it will split it up.
  */
@@ -1202,7 +1202,7 @@ static u8 set_controller_speed(struct controller *ctrl, u8 adapter_speed, u8 hp_
 
 	mdelay(5);
 
-	/* Reenable interrupts */
+	/* Re-enable interrupts */
 	writel(0, ctrl->hpc_reg + INT_MASK);
 
 	pci_write_config_byte(ctrl->pci_dev, 0x41, reg);
@@ -1872,14 +1872,12 @@ static void interrupt_event_handler(struct controller *ctrl)
 			}
 		}		/* End of FOR loop */
 	}
-
-	return;
 }
 
 
 /**
  * cpqhp_pushbutton_thread - handle pushbutton events
- * @slot: target slot (struct)
+ * @t: pointer to struct timer_list which holds all timer-related callbacks
  *
  * Scheduled procedure to handle blocking stuff for the pushbuttons.
  * Handles all pending events and exits.
@@ -1943,8 +1941,6 @@ void cpqhp_pushbutton_thread(struct timer_list *t)
 
 		p_slot->state = STATIC_STATE;
 	}
-
-	return;
 }
 
 

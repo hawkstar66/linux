@@ -29,11 +29,18 @@
 #include <linux/module.h>
 #include <linux/console.h>
 #include <linux/pci.h>
-#include <drm/drmP.h>
+#include <linux/poll.h>
+#include <linux/wait.h>
+
 #include <drm/drm.h>
+#include <drm/drm_aperture.h>
+#include <drm/drm_atomic_helper.h>
+#include <drm/drm_drv.h>
+#include <drm/drm_file.h>
 
 #include "virtgpu_drv.h"
-static struct drm_driver driver;
+
+static const struct drm_driver driver;
 
 static int virtio_gpu_modeset = -1;
 
@@ -46,15 +53,16 @@ static int virtio_gpu_pci_quirk(struct drm_device *dev, struct virtio_device *vd
 	const char *pname = dev_name(&pdev->dev);
 	bool vga = (pdev->class >> 8) == PCI_CLASS_DISPLAY_VGA;
 	char unique[20];
+	int ret;
 
 	DRM_INFO("pci: %s detected at %s\n",
 		 vga ? "virtio-vga" : "virtio-gpu-pci",
 		 pname);
-	dev->pdev = pdev;
-	if (vga)
-		drm_fb_helper_remove_conflicting_pci_framebuffers(pdev,
-								  0,
-								  "virtiodrmfb");
+	if (vga) {
+		ret = drm_aperture_remove_conflicting_pci_framebuffers(pdev, &driver);
+		if (ret)
+			return ret;
+	}
 
 	/*
 	 * Normally the drm_dev_set_unique() call is done by core DRM.
@@ -119,11 +127,13 @@ static int virtio_gpu_probe(struct virtio_device *vdev)
 
 	ret = drm_dev_register(dev, 0);
 	if (ret)
-		goto err_free;
+		goto err_deinit;
 
 	drm_fbdev_generic_setup(vdev->priv, 32);
 	return 0;
 
+err_deinit:
+	virtio_gpu_deinit(dev);
 err_free:
 	drm_dev_put(dev);
 	return ret;
@@ -133,9 +143,10 @@ static void virtio_gpu_remove(struct virtio_device *vdev)
 {
 	struct drm_device *dev = vdev->priv;
 
-	drm_dev_unregister(dev);
+	drm_dev_unplug(dev);
+	drm_atomic_helper_shutdown(dev);
 	virtio_gpu_deinit(dev);
-	drm_put_dev(dev);
+	drm_dev_put(dev);
 }
 
 static void virtio_gpu_config_changed(struct virtio_device *vdev)
@@ -144,6 +155,36 @@ static void virtio_gpu_config_changed(struct virtio_device *vdev)
 	struct virtio_gpu_device *vgdev = dev->dev_private;
 
 	schedule_work(&vgdev->config_changed_work);
+}
+
+static __poll_t virtio_gpu_poll(struct file *filp,
+				struct poll_table_struct *wait)
+{
+	struct drm_file *drm_file = filp->private_data;
+	struct virtio_gpu_fpriv *vfpriv = drm_file->driver_priv;
+	struct drm_device *dev = drm_file->minor->dev;
+	struct virtio_gpu_device *vgdev = dev->dev_private;
+	struct drm_pending_event *e = NULL;
+	__poll_t mask = 0;
+
+	if (!vgdev->has_virgl_3d || !vfpriv || !vfpriv->ring_idx_mask)
+		return drm_poll(filp, wait);
+
+	poll_wait(filp, &drm_file->event_wait, wait);
+
+	if (!list_empty(&drm_file->event_list)) {
+		spin_lock_irq(&dev->event_lock);
+		e = list_first_entry(&drm_file->event_list,
+				     struct drm_pending_event, link);
+		drm_file->event_space += e->event->length;
+		list_del(&e->link);
+		spin_unlock_irq(&dev->event_lock);
+
+		kfree(e);
+		mask |= EPOLLIN | EPOLLRDNORM;
+	}
+
+	return mask;
 }
 
 static struct virtio_device_id id_table[] = {
@@ -161,6 +202,9 @@ static unsigned int features[] = {
 	VIRTIO_GPU_F_VIRGL,
 #endif
 	VIRTIO_GPU_F_EDID,
+	VIRTIO_GPU_F_RESOURCE_UUID,
+	VIRTIO_GPU_F_RESOURCE_BLOB,
+	VIRTIO_GPU_F_CONTEXT_INIT,
 };
 static struct virtio_driver virtio_gpu_driver = {
 	.feature_table = features,
@@ -183,19 +227,19 @@ MODULE_AUTHOR("Gerd Hoffmann <kraxel@redhat.com>");
 MODULE_AUTHOR("Alon Levy");
 
 static const struct file_operations virtio_gpu_driver_fops = {
-	.owner = THIS_MODULE,
-	.open = drm_open,
-	.mmap = virtio_gpu_mmap,
-	.poll = drm_poll,
-	.read = drm_read,
-	.unlocked_ioctl	= drm_ioctl,
-	.release = drm_release,
-	.compat_ioctl = drm_compat_ioctl,
-	.llseek = noop_llseek,
+	.owner          = THIS_MODULE,
+	.open           = drm_open,
+	.release        = drm_release,
+	.unlocked_ioctl = drm_ioctl,
+	.compat_ioctl   = drm_compat_ioctl,
+	.poll           = virtio_gpu_poll,
+	.read           = drm_read,
+	.llseek         = noop_llseek,
+	.mmap           = drm_gem_mmap
 };
 
-static struct drm_driver driver = {
-	.driver_features = DRIVER_MODESET | DRIVER_GEM | DRIVER_PRIME | DRIVER_RENDER | DRIVER_ATOMIC,
+static const struct drm_driver driver = {
+	.driver_features = DRIVER_MODESET | DRIVER_GEM | DRIVER_RENDER | DRIVER_ATOMIC,
 	.open = virtio_gpu_driver_open,
 	.postclose = virtio_gpu_driver_postclose,
 
@@ -207,17 +251,11 @@ static struct drm_driver driver = {
 #endif
 	.prime_handle_to_fd = drm_gem_prime_handle_to_fd,
 	.prime_fd_to_handle = drm_gem_prime_fd_to_handle,
-	.gem_prime_export = drm_gem_prime_export,
-	.gem_prime_import = drm_gem_prime_import,
-	.gem_prime_get_sg_table = virtgpu_gem_prime_get_sg_table,
+	.gem_prime_mmap = drm_gem_prime_mmap,
+	.gem_prime_import = virtgpu_gem_prime_import,
 	.gem_prime_import_sg_table = virtgpu_gem_prime_import_sg_table,
-	.gem_prime_vmap = virtgpu_gem_prime_vmap,
-	.gem_prime_vunmap = virtgpu_gem_prime_vunmap,
-	.gem_prime_mmap = virtgpu_gem_prime_mmap,
 
-	.gem_free_object_unlocked = virtio_gpu_gem_free_object,
-	.gem_open_object = virtio_gpu_gem_object_open,
-	.gem_close_object = virtio_gpu_gem_object_close,
+	.gem_create_object = virtio_gpu_create_object,
 	.fops = &virtio_gpu_driver_fops,
 
 	.ioctls = virtio_gpu_ioctls,
@@ -229,4 +267,6 @@ static struct drm_driver driver = {
 	.major = DRIVER_MAJOR,
 	.minor = DRIVER_MINOR,
 	.patchlevel = DRIVER_PATCHLEVEL,
+
+	.release = virtio_gpu_release,
 };

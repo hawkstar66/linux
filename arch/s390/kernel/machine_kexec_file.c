@@ -10,7 +10,7 @@
 #include <linux/elf.h>
 #include <linux/errno.h>
 #include <linux/kexec.h>
-#include <linux/module.h>
+#include <linux/module_signature.h>
 #include <linux/verification.h>
 #include <asm/boot_data.h>
 #include <asm/ipl.h>
@@ -22,29 +22,7 @@ const struct kexec_file_ops * const kexec_file_loaders[] = {
 	NULL,
 };
 
-#ifdef CONFIG_KEXEC_VERIFY_SIG
-/*
- * Module signature information block.
- *
- * The constituents of the signature section are, in order:
- *
- *	- Signer's name
- *	- Key identifier
- *	- Signature data
- *	- Information block
- */
-struct module_signature {
-	u8	algo;		/* Public-key crypto algorithm [0] */
-	u8	hash;		/* Digest algorithm [0] */
-	u8	id_type;	/* Key identifier type [PKEY_ID_PKCS7] */
-	u8	signer_len;	/* Length of signer's name [0] */
-	u8	key_id_len;	/* Length of key identifier [0] */
-	u8	__pad[3];
-	__be32	sig_len;	/* Length of signature data */
-};
-
-#define PKEY_ID_PKCS7 2
-
+#ifdef CONFIG_KEXEC_SIG
 int s390_verify_sig(const char *kernel, unsigned long kernel_len)
 {
 	const unsigned long marker_len = sizeof(MODULE_SIG_STRING) - 1;
@@ -90,7 +68,7 @@ int s390_verify_sig(const char *kernel, unsigned long kernel_len)
 				      VERIFYING_MODULE_SIGNATURE,
 				      NULL, NULL);
 }
-#endif /* CONFIG_KEXEC_VERIFY_SIG */
+#endif /* CONFIG_KEXEC_SIG */
 
 static int kexec_file_update_purgatory(struct kimage *image,
 				       struct s390_load_data *data)
@@ -173,7 +151,7 @@ static int kexec_file_add_initrd(struct kimage *image,
 		buf.mem += crashk_res.start;
 	buf.memsz = buf.bufsz;
 
-	data->parm->initrd_start = buf.mem;
+	data->parm->initrd_start = data->memsz;
 	data->parm->initrd_size = buf.memsz;
 	data->memsz += buf.memsz;
 
@@ -238,7 +216,9 @@ void *kexec_file_add_components(struct kimage *image,
 				int (*add_kernel)(struct kimage *image,
 						  struct s390_load_data *data))
 {
+	unsigned long max_command_line_size = LEGACY_COMMAND_LINE_SIZE;
 	struct s390_load_data data = {0};
+	unsigned long minsize;
 	int ret;
 
 	data.report = ipl_report_init(&ipl_block);
@@ -249,10 +229,23 @@ void *kexec_file_add_components(struct kimage *image,
 	if (ret)
 		goto out;
 
-	if (image->cmdline_buf_len >= ARCH_COMMAND_LINE_SIZE) {
-		ret = -EINVAL;
+	ret = -EINVAL;
+	minsize = PARMAREA + offsetof(struct parmarea, command_line);
+	if (image->kernel_buf_len < minsize)
 		goto out;
-	}
+
+	if (data.parm->max_command_line_size)
+		max_command_line_size = data.parm->max_command_line_size;
+
+	if (minsize + max_command_line_size < minsize)
+		goto out;
+
+	if (image->kernel_buf_len < minsize + max_command_line_size)
+		goto out;
+
+	if (image->cmdline_buf_len >= max_command_line_size)
+		goto out;
+
 	memcpy(data.parm->command_line, image->cmdline_buf,
 	       image->cmdline_buf_len);
 
@@ -328,18 +321,4 @@ int arch_kexec_apply_relocations_add(struct purgatory_info *pi,
 		arch_kexec_do_relocs(r_type, loc, val, addr);
 	}
 	return 0;
-}
-
-int arch_kexec_kernel_image_probe(struct kimage *image, void *buf,
-				  unsigned long buf_len)
-{
-	/* A kernel must be at least large enough to contain head.S. During
-	 * load memory in head.S will be accessed, e.g. to register the next
-	 * command line. If the next kernel were smaller the current kernel
-	 * will panic at load.
-	 */
-	if (buf_len < HEAD_END)
-		return -ENOEXEC;
-
-	return kexec_image_probe_default(image, buf, buf_len);
 }

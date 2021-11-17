@@ -19,7 +19,7 @@ static void komeda_fb_destroy(struct drm_framebuffer *fb)
 	u32 i;
 
 	for (i = 0; i < fb->format->num_planes; i++)
-		drm_gem_object_put_unlocked(fb->obj[i]);
+		drm_gem_object_put(fb->obj[i]);
 
 	drm_framebuffer_cleanup(fb);
 	kfree(kfb);
@@ -43,7 +43,7 @@ komeda_fb_afbc_size_check(struct komeda_fb *kfb, struct drm_file *file,
 	struct drm_framebuffer *fb = &kfb->base;
 	const struct drm_format_info *info = fb->format;
 	struct drm_gem_object *obj;
-	u32 alignment_w = 0, alignment_h = 0, alignment_header, n_blocks;
+	u32 alignment_w = 0, alignment_h = 0, alignment_header, n_blocks, bpp;
 	u64 min_size;
 
 	obj = drm_gem_object_lookup(file, mode_cmd->handles[0]);
@@ -88,8 +88,9 @@ komeda_fb_afbc_size_check(struct komeda_fb *kfb, struct drm_file *file,
 	kfb->offset_payload = ALIGN(n_blocks * AFBC_HEADER_SIZE,
 				    alignment_header);
 
+	bpp = komeda_get_afbc_format_bpp(info, fb->modifier);
 	kfb->afbc_size = kfb->offset_payload + n_blocks *
-			 ALIGN(info->cpp[0] * AFBC_SUPERBLK_PIXELS,
+			 ALIGN(bpp * AFBC_SUPERBLK_PIXELS / 8,
 			       AFBC_SUPERBLK_ALIGNMENT);
 	min_size = kfb->afbc_size + fb->offsets[0];
 	if (min_size > obj->size) {
@@ -102,7 +103,7 @@ komeda_fb_afbc_size_check(struct komeda_fb *kfb, struct drm_file *file,
 	return 0;
 
 check_failed:
-	drm_gem_object_put_unlocked(obj);
+	drm_gem_object_put(obj);
 	return -EINVAL;
 }
 
@@ -198,7 +199,7 @@ komeda_fb_create(struct drm_device *dev, struct drm_file *file,
 
 err_cleanup:
 	for (i = 0; i < kfb->base.format->num_planes; i++)
-		drm_gem_object_put_unlocked(kfb->base.obj[i]);
+		drm_gem_object_put(kfb->base.obj[i]);
 
 	kfree(kfb);
 	return ERR_PTR(ret);
@@ -275,8 +276,8 @@ bool komeda_fb_is_layer_supported(struct komeda_fb *kfb, u32 layer_type,
 	supported = komeda_format_mod_supported(&mdev->fmt_tbl, layer_type,
 						fourcc, modifier, rot);
 	if (!supported)
-		DRM_DEBUG_ATOMIC("Layer TYPE: %d doesn't support fb FMT: %s.\n",
-			layer_type, komeda_get_format_name(fourcc, modifier));
+		DRM_DEBUG_ATOMIC("Layer TYPE: %d doesn't support fb FMT: %p4cc with modifier: 0x%llx.\n",
+				 layer_type, &fourcc, modifier);
 
 	return supported;
 }

@@ -65,15 +65,16 @@ int siw_reap_cqe(struct siw_cq *cq, struct ib_wc *wc)
 		 * reaped here, which do not hold a QP reference
 		 * and do not qualify for memory extension verbs.
 		 */
-		if (likely(cq->kernel_verbs)) {
+		if (likely(rdma_is_kernel_res(&cq->base_cq.res))) {
 			if (cqe->flags & SIW_WQE_REM_INVAL) {
 				wc->ex.invalidate_rkey = cqe->inval_stag;
 				wc->wc_flags = IB_WC_WITH_INVALIDATE;
 			}
 			wc->qp = cqe->base_qp;
-			siw_dbg_cq(cq, "idx %u, type %d, flags %2x, id 0x%p\n",
+			siw_dbg_cq(cq,
+				   "idx %u, type %d, flags %2x, id 0x%pK\n",
 				   cq->cq_get % cq->num_cqe, cqe->opcode,
-				   cqe->flags, (void *)cqe->id);
+				   cqe->flags, (void *)(uintptr_t)cqe->id);
 		}
 		WRITE_ONCE(cqe->flags, 0);
 		cq->cq_get++;
